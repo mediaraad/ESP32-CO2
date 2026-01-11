@@ -12,7 +12,7 @@
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <HTTPClient.h> // Bibliotheek voor HTTP REST calls
-
+#include "secrets.h" // PASSWORDS ENZO 
 // ==========================================================
 // ======== 🚨 Configuratie AANPASSEN! 🚨 (Jouw settings) ========
 // ==========================================================
@@ -24,8 +24,9 @@ const int HA_PORT = 8123;
 const char* HA_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhYzcxMzU5Nzk0N2M0Mjg2YjJmOWZhYTUzMzY4ODQyMCIsImlhdCI6MTc2NTYyNzkxNywiZXhwIjoyMDgwOTg3OTE3fQ.7NOwefg_wouE4pGJ8VZE0hYCkbLH4Rc8K3qo2bUfS-g"; 
 
 // WiFi Gegevens
-const char* ssid     = "MEDIARAADTP24";
-const char* password = "sesamopenu2";
+
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 // ==========================================================
 
@@ -224,11 +225,13 @@ void sendAllSensorData(){
 }
 
 // -------- Web Interface (blijft hetzelfde) --------
-void handleRoot(){
+void handleRoot() {
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Air Quality Monitor</title>";
     html += "<meta http-equiv='refresh' content='2'>";
     html += "<style>body{font-family:sans-serif;text-align:center;} table{margin:auto;border-collapse:collapse;} td,th{padding:8px;border:1px solid #333;}</style>";
-    html += "</head><body><h2>ESP32 Air Quality Monitor</h2><table>";
+    html += "</head><body><h2>ESP32 Air Quality Monitor Beneden</h2><table>";
+
+    // Sensoren
     html += "<tr><th>Sensor</th><th>Value</th></tr>";
     html += "<tr><td>CO2 ppm</td><td>" + String(co2_ppm) + "</td></tr>";
     html += "<tr><td>Temp SCD C</td><td>" + String(tC_scd,2) + "</td></tr>";
@@ -239,8 +242,20 @@ void handleRoot(){
     html += "<tr><td>eCO2 ppm</td><td>" + String(eco2_ppm) + "</td></tr>";
     html += "<tr><td>AQI</td><td>" + String(aqi) + " (" + String(aqiText(aqi)) + ")</td></tr>";
     html += "<tr><td>Ventilation</td><td>" + String(ventHint(co2_ppm)) + "</td></tr>";
+
+    // WiFi info
+    html += "<tr><th colspan='2'>WiFi Info</th></tr>";
+    html += "<tr><td>Connected BSSID</td><td>" + WiFi.BSSIDstr() + "</td></tr>";
+    html += "<tr><td>Connected SSID</td><td>" + WiFi.SSID() + "</td></tr>";
+    html += "<tr><td>DNS</td><td>" + WiFi.dnsIP(0).toString() + " " + WiFi.dnsIP(1).toString() + "</td></tr>";
+    html += "<tr><td>IP Address</td><td>" + WiFi.localIP().toString() + "</td></tr>";
+    html += "<tr><td>MAC Address</td><td>" + WiFi.macAddress() + "</td></tr>";
+    html += "<tr><td>Signal Strength</td><td>" + String(WiFi.RSSI()) + " dBm / " + String(map(WiFi.RSSI(),-100,-50,0,100)) + " %</td></tr>";
+
+    // Sluit tabel en pagina
     html += "</table></body></html>";
-    server.send(200,"text/html",html);
+
+    server.send(200, "text/html", html);
 }
 
 // -------- JSON endpoint (blijft hetzelfde) --------
