@@ -1,248 +1,322 @@
 /*
-  ESP32 Air Quality Monitor
-  SCD41 + ENS160 + AHT21
-  Web interface + JSON API + MQTT + Home Assistant Discovery
-  All sensors grouped under 1 device, discovery republished on reconnect
-  and when Home Assistant publishes homeassistant/status = online
-*/
+ * ESP32 Air Quality Monitor
+ * SCD41 + ENS160 + AHT21
+ * Web interface + JSON API + Home Assistant REST API Client
+ */
 
 #include <WiFi.h>
 #include <Wire.h>
-#include <PubSubClient.h>
 #include <SensirionI2cScd4x.h>
 #include "SparkFun_ENS160.h"
 #include <Adafruit_AHTX0.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
+#include <HTTPClient.h> // Bibliotheek voor HTTP REST calls
 
-#include "secrets.h"
+// ==========================================================
+// ======== 🚨 Configuratie AANPASSEN! 🚨 (Jouw settings) ========
+// ==========================================================
 
-// -------- WiFi Settings --------
-const char* ssid     = WIFI_SSID;
-const char* password = WIFI_PASSWORD;
+// Home Assistant (HA) REST API Instellingen
+const char* HA_IP = "homeassistant.local"; // Vul het IP van je HA-server in
+const int HA_PORT = 8123;
+// VUL HIER JE GEGENEREERDE LONG-LIVED ACCESS TOKEN IN!
+const char* HA_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhYzcxMzU5Nzk0N2M0Mjg2YjJmOWZhYTUzMzY4ODQyMCIsImlhdCI6MTc2NTYyNzkxNywiZXhwIjoyMDgwOTg3OTE3fQ.7NOwefg_wouE4pGJ8VZE0hYCkbLH4Rc8K3qo2bUfS-g"; 
 
-// -------- MQTT Settings --------
-const char* mqtt_server = MQTT_SERVER;
-const int mqtt_port     = MQTT_PORT;
-const char* mqtt_user   = MQTT_USER;
-const char* mqtt_pass   = MQTT_PASSWORD;
+// WiFi Gegevens
+const char* ssid     = "MEDIARAADTP24";
+const char* password = "sesamopenu2";
 
+// ==========================================================
 
-const char* mqtt_topic       = "home/airquality";
-const char* ha_status_topic  = "homeassistant/status"; 
-const char* ha_avail_topic   = "homeassistant/sensor/esp32_airquality/availability"; 
+// Unieke ID voor DIT apparaat (Voor groepering in HA als één Apparaat)
+const char* DEVICE_ID = "esp32_airquality_001"; 
 
-WiFiClient espClient;
-PubSubClient mqtt(espClient);
+// -------- Sensor Objecten --------
+SparkFun_ENS160 ens;
+SensirionI2cScd4x scd4x;
+Adafruit_AHTX0 aht;
+WebServer server(80);
+
+// -------- Sensor Variabelen --------
+uint16_t co2_ppm=0, tvoc_ppb=0, eco2_ppm=0;
+float tC_scd=NAN, rh_scd=NAN, tC_aht=NAN, rh_aht=NAN;
+uint8_t aqi=0;
 
 // -------- I2C Pins --------
 #define SDA_PIN 21
 #define SCL_PIN 22
 #define SCD41_ADDR 0x62
 
-// -------- Sensor Objects --------
-SensirionI2cScd4x scd4x;
-SparkFun_ENS160 ens;
-Adafruit_AHTX0 aht;
-WebServer server(80);
-
-// -------- Sensor Variables --------
-uint16_t co2_ppm=0, tvoc_ppb=0, eco2_ppm=0;
-float tC_scd=NAN, rh_scd=NAN, tC_aht=NAN, rh_aht=NAN;
-uint8_t aqi=0;
-
-// -------- Helper Functions --------
+// -------- Helper Functies --------
 const char* aqiText(uint8_t v){
-  switch(v){
-    case 1: return "Excellent"; case 2: return "Good";
-    case 3: return "Moderate"; case 4: return "Poor"; case 5: return "Unhealthy";
-  }
-  return "?";
+    switch(v){
+        case 1: return "Super"; 
+        case 2: return "Goed";
+        case 3: return "Matig"; 
+        case 4: return "Slecht"; 
+        case 5: return "Ongezond";
+    }
+    return "?";
 }
 
 const char* ventHint(uint16_t co2){
-  if(co2>=1500) return "VENTILATE NOW";
-  if(co2>=1000) return "Add fresh air";
-  if(co2>=800)  return "Okay";
-  return "Good";
+    if(co2>=1500) return "Ventileer nu !";
+    if(co2>=1000) return "Is een goed idee";
+    if(co2>=800)  return "Eventueel";
+    return "Niet nodig";
 }
 
-// -------- MQTT Discovery (single sensor) --------
-void publishOneDiscovery(const char* sensor_id, const char* name, const char* unit, const char* json_path){
-  StaticJsonDocument<512> doc;
-  String topic = String("homeassistant/sensor/") + sensor_id + "/config";
+// -------- REST API FUNCTIES (Kern van de communicatie) --------
 
-  doc["name"] = name;
-  doc["state_topic"] = mqtt_topic;
-  if (strlen(unit) > 0) doc["unit_of_measurement"] = unit;
-  doc["value_template"] = String("{{ value_json.") + json_path + " }}";
-  doc["unique_id"] = sensor_id;
-
-  // Device object (all sensors must use same identifiers)
-  JsonObject device = doc.createNestedObject("device");
-  JsonArray ids = device.createNestedArray("identifiers");
-  ids.add("esp32_airquality_001");    // SAME for all sensors!
-  device["name"] = "ESP32 Air Quality Monitor";
-  device["model"] = "ESP32 SCD41 + ENS160 + AHT21";
-  device["manufacturer"] = "DroneBot Workshop";
-
-  // Availability (optional but recommended)
-  doc["availability_topic"] = ha_status_topic;
-  doc["payload_available"] = "online";
-  doc["payload_not_available"] = "offline";
-
-  char buffer[512];
-  size_t n = serializeJson(doc, buffer);
-  bool ok = mqtt.publish(topic.c_str(), (const uint8_t*)buffer, n, true); // retain=true
-  if(ok) Serial.println("[MQTT] Discovery published: " + String(sensor_id) + " -> " + topic);
-  else Serial.println("[MQTT] Discovery FAILED: " + String(sensor_id) + " -> " + topic);
-}
-
-// -------- Publish all discovery topics --------
-void publishAllDiscovery(){
-  publishOneDiscovery("esp32_co2_001",      "CO2",     "ppm", "co2");
-  publishOneDiscovery("esp32_tvoc_001",     "TVOC",    "ppb", "tvoc");
-  publishOneDiscovery("esp32_eco2_001",     "eCO2",    "ppm", "eco2");
-  publishOneDiscovery("esp32_aqi_001",      "AQI",     "",    "aqi");
-  publishOneDiscovery("esp32_temp_aht_001", "Temp AHT","°C",  "t_aht");
-  publishOneDiscovery("esp32_rh_aht_001",   "RH AHT",  "%",   "rh_aht");
-  publishOneDiscovery("esp32_temp_scd_001", "Temp SCD","°C",  "t_scd");
-  publishOneDiscovery("esp32_rh_scd_001",   "RH SCD",  "%",   "rh_scd");
-}
-
-// -------- MQTT message callback (listens for HA online) --------
-void mqttCallback(char* topic, byte* payload, unsigned int length){
-  String t = String(topic);
-  String msg;
-  for(unsigned int i=0;i<length;i++) msg += (char)payload[i];
-  Serial.println("[MQTT] Message arrived on topic: " + t + " payload: " + msg);
-
-  if(t.equals(ha_status_topic) && msg == "online"){
-    Serial.println("[MQTT] Home Assistant ONLINE -> re-publishing discovery");
-    publishAllDiscovery();
-  }
-}
-
-// -------- MQTT Reconnect --------
-void reconnectMQTT(){
-  while(!mqtt.connected()){
-    Serial.print("[MQTT] Connecting...");
-    mqtt.setCallback(mqttCallback);
-    if(mqtt.connect("ESP32_AirMonitor", mqtt_user, mqtt_pass)){
-      Serial.println("connected!");
-      mqtt.subscribe(ha_status_topic);
-      publishAllDiscovery();
-      mqtt.publish(ha_avail_topic, "online", true);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(mqtt.state());
-      Serial.println(", retrying in 2s");
-      delay(2000);
+/**
+ * Verstuurt een enkele sensorstatus naar Home Assistant via een HTTP POST.
+ */
+void sendToHASensorState(float value, const char* entity_suffix, const char* unit, const char* friendly_name, const char* device_class) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[REST] WiFi niet verbonden.");
+        return;
     }
-  }
+
+    HTTPClient http;
+    String entity_id = "sensor." + String(DEVICE_ID) + "_" + String(entity_suffix);
+    String url = "http://" + String(HA_IP) + ":" + String(HA_PORT) + "/api/states/" + entity_id;
+    http.begin(url); 
+    
+    http.addHeader("Authorization", "Bearer " + String(HA_TOKEN));
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<512> doc;
+    doc["state"] = value;
+    doc["unique_id"] = String(DEVICE_ID) + "_" + String(entity_suffix);
+
+    JsonObject attributes = doc.createNestedObject("attributes");
+    attributes["unit_of_measurement"] = unit;
+    attributes["friendly_name"] = friendly_name; 
+    attributes["device_class"] = device_class;
+    
+    JsonObject device = attributes.createNestedObject("device");
+    device["identifiers"] = DEVICE_ID;
+    device["name"] = "ESP32 Air Quality Monitor";
+    device["model"] = "ESP32 SCD41 + ENS160 + AHT21";
+    device["manufacturer"] = "DroneBot Workshop";
+    
+    String payload;
+    serializeJson(doc, payload);
+
+    int httpResponseCode = http.POST(payload);
+    if (httpResponseCode > 0) {
+        Serial.printf("[REST] HA POST OK (%s), Code: %d\n", entity_id.c_str(), httpResponseCode);
+    } else {
+        Serial.printf("[REST] HA POST FAIL (%s), Code: %d, Error: %s\n", 
+                        entity_id.c_str(), httpResponseCode, http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
 }
 
-// -------- Web Interface --------
+/**
+ * Verstuur AQI als TEKST naar Home Assistant
+ */
+void sendAQIText(){
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    String entity_id = "sensor." + String(DEVICE_ID) + "_aqi_text_001";
+    String url = "http://" + String(HA_IP) + ":" + String(HA_PORT) + "/api/states/" + entity_id;
+    
+    http.begin(url);
+    http.addHeader("Authorization", "Bearer " + String(HA_TOKEN));
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<256> doc;
+    doc["state"] = String(aqiText(aqi));
+    doc["unique_id"] = String(DEVICE_ID) + "_aqi_text_001";
+
+    JsonObject attributes = doc.createNestedObject("attributes");
+    attributes["friendly_name"] = "AQI Text";
+    
+    JsonObject device = attributes.createNestedObject("device");
+    device["identifiers"] = DEVICE_ID;
+    device["name"] = "ESP32 Air Quality Monitor";
+    device["model"] = "ESP32 SCD41 + ENS160 + AHT21";
+    device["manufacturer"] = "DroneBot Workshop";
+
+    String payload;
+    serializeJson(doc, payload);
+
+    int httpResponseCode = http.POST(payload);
+    if (httpResponseCode > 0) {
+        Serial.printf("[REST] HA POST OK (%s), Code: %d\n", entity_id.c_str(), httpResponseCode);
+    } else {
+        Serial.printf("[REST] HA POST FAIL (%s), Code: %d, Error: %s\n", 
+                      entity_id.c_str(), httpResponseCode, http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
+}
+
+/**
+ * Verstuur VentHint naar Home Assistant
+ */
+void sendVentHint(){
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    String entity_id = "sensor." + String(DEVICE_ID) + "_vent_001";
+    String url = "http://" + String(HA_IP) + ":" + String(HA_PORT) + "/api/states/" + entity_id;
+
+    http.begin(url);
+    http.addHeader("Authorization", "Bearer " + String(HA_TOKEN));
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<256> doc;
+    doc["state"] = String(ventHint(co2_ppm));
+    doc["unique_id"] = String(DEVICE_ID) + "_vent_001";
+
+    JsonObject attributes = doc.createNestedObject("attributes");
+    attributes["friendly_name"] = "Ventilation Hint";
+
+    JsonObject device = attributes.createNestedObject("device");
+    device["identifiers"] = DEVICE_ID;
+    device["name"] = "ESP32 Air Quality Monitor";
+    device["model"] = "ESP32 SCD41 + ENS160 + AHT21";
+    device["manufacturer"] = "DroneBot Workshop";
+
+    String payload;
+    serializeJson(doc, payload);
+
+    int httpResponseCode = http.POST(payload);
+    if (httpResponseCode > 0) {
+        Serial.printf("[REST] HA POST OK (%s), Code: %d\n", entity_id.c_str(), httpResponseCode);
+    } else {
+        Serial.printf("[REST] HA POST FAIL (%s), Code: %d, Error: %s\n", 
+                      entity_id.c_str(), httpResponseCode, http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
+}
+
+/**
+ * Roept de sendToHASensorState aan voor alle sensoren.
+ */
+void sendAllSensorData(){
+    // CO2 (PPM)
+    sendToHASensorState(co2_ppm, "co2_001", "ppm", "CO2", "carbon_dioxide");
+    
+    // TVOC (PPB)
+    sendToHASensorState(tvoc_ppb, "tvoc_001", "ppb", "TVOC", "volatile_organic_compounds");
+    
+    // eCO2 (PPM)
+    sendToHASensorState(eco2_ppm, "eco2_001", "ppm", "eCO2", "carbon_dioxide");
+    
+    // AQI (Index)
+    sendToHASensorState(aqi, "aqi_001", "", "AQI", "aqi"); 
+
+    // Temp AHT (°C)
+    if (!isnan(tC_aht)) sendToHASensorState(tC_aht, "temp_aht_001", "°C", "Temp AHT", "temperature");
+    
+    // RH AHT (%)
+    if (!isnan(rh_aht)) sendToHASensorState(rh_aht, "rh_aht_001", "%", "RH AHT", "humidity");
+    
+    // Temp SCD (°C)
+    if (!isnan(tC_scd)) sendToHASensorState(tC_scd, "temp_scd_001", "°C", "Temp SCD", "temperature");
+    
+    // RH SCD (%)
+    if (!isnan(rh_scd)) sendToHASensorState(rh_scd, "rh_scd_001", "%", "RH SCD", "humidity");
+}
+
+// -------- Web Interface (blijft hetzelfde) --------
 void handleRoot(){
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Air Quality Monitor</title>";
-  html += "<meta http-equiv='refresh' content='2'>";
-  html += "<style>body{font-family:sans-serif;text-align:center;} table{margin:auto;border-collapse:collapse;} td,th{padding:8px;border:1px solid #333;}</style>";
-  html += "</head><body><h2>ESP32 Air Quality Monitor</h2><table>";
-  html += "<tr><th>Sensor</th><th>Value</th></tr>";
-  html += "<tr><td>CO2 ppm</td><td>" + String(co2_ppm) + "</td></tr>";
-  html += "<tr><td>Temp SCD C</td><td>" + String(tC_scd,2) + "</td></tr>";
-  html += "<tr><td>RH SCD %</td><td>" + String(rh_scd,1) + "</td></tr>";
-  html += "<tr><td>Temp AHT C</td><td>" + String(tC_aht,2) + "</td></tr>";
-  html += "<tr><td>RH AHT %</td><td>" + String(rh_aht,1) + "</td></tr>";
-  html += "<tr><td>TVOC ppb</td><td>" + String(tvoc_ppb) + "</td></tr>";
-  html += "<tr><td>eCO2 ppm</td><td>" + String(eco2_ppm) + "</td></tr>";
-  html += "<tr><td>AQI</td><td>" + String(aqi) + " (" + String(aqiText(aqi)) + ")</td></tr>";
-  html += "<tr><td>Ventilation</td><td>" + String(ventHint(co2_ppm)) + "</td></tr>";
-  html += "</table></body></html>";
-  server.send(200,"text/html",html);
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Air Quality Monitor</title>";
+    html += "<meta http-equiv='refresh' content='2'>";
+    html += "<style>body{font-family:sans-serif;text-align:center;} table{margin:auto;border-collapse:collapse;} td,th{padding:8px;border:1px solid #333;}</style>";
+    html += "</head><body><h2>ESP32 Air Quality Monitor</h2><table>";
+    html += "<tr><th>Sensor</th><th>Value</th></tr>";
+    html += "<tr><td>CO2 ppm</td><td>" + String(co2_ppm) + "</td></tr>";
+    html += "<tr><td>Temp SCD C</td><td>" + String(tC_scd,2) + "</td></tr>";
+    html += "<tr><td>RH SCD %</td><td>" + String(rh_scd,1) + "</td></tr>";
+    html += "<tr><td>Temp AHT C</td><td>" + String(tC_aht,2) + "</td></tr>";
+    html += "<tr><td>RH AHT %</td><td>" + String(rh_aht,1) + "</td></tr>";
+    html += "<tr><td>TVOC ppb</td><td>" + String(tvoc_ppb) + "</td></tr>";
+    html += "<tr><td>eCO2 ppm</td><td>" + String(eco2_ppm) + "</td></tr>";
+    html += "<tr><td>AQI</td><td>" + String(aqi) + " (" + String(aqiText(aqi)) + ")</td></tr>";
+    html += "<tr><td>Ventilation</td><td>" + String(ventHint(co2_ppm)) + "</td></tr>";
+    html += "</table></body></html>";
+    server.send(200,"text/html",html);
 }
 
+// -------- JSON endpoint (blijft hetzelfde) --------
 void handleJson(){
-  StaticJsonDocument<256> doc;
-  doc["co2"] = co2_ppm;
-  if(!isnan(tC_scd)) doc["t_scd"] = tC_scd;
-  if(!isnan(rh_scd)) doc["rh_scd"] = rh_scd;
-  doc["t_aht"] = tC_aht;
-  doc["rh_aht"] = rh_aht;
-  doc["tvoc"] = tvoc_ppb;
-  doc["eco2"] = eco2_ppm;
-  doc["aqi"] = aqi;
-  String output;
-  serializeJson(doc, output);
-  server.send(200,"application/json",output);
+    StaticJsonDocument<256> doc;
+    doc["co2"]=co2_ppm;
+    if(!isnan(tC_scd)) doc["t_scd"]=tC_scd; else doc["t_scd"]=JsonVariant(); 
+    if(!isnan(rh_scd)) doc["rh_scd"]=rh_scd; else doc["rh_scd"]=JsonVariant();
+    doc["t_aht"]=tC_aht;
+    doc["rh_aht"]=rh_aht;
+    doc["tvoc"]=tvoc_ppb;
+    doc["eco2"]=eco2_ppm;
+    doc["aqi"]=aqi;
+    String output;
+    serializeJson(doc,output);
+    server.send(200,"application/json",output);
 }
 
 // -------- Setup --------
 void setup(){
-  Serial.begin(115200);
-  delay(200);
+    Serial.begin(115200);
+    delay(200);
 
-  WiFi.begin(ssid,password);
-  while(WiFi.status()!=WL_CONNECTED){ delay(500); Serial.print("."); }
-  Serial.println("\n[WiFi] Connected, IP: " + WiFi.localIP().toString());
+    // WiFi connectie
+    WiFi.begin(ssid,password);
+    while(WiFi.status()!=WL_CONNECTED){ delay(500); Serial.print("."); }
+    Serial.println("\n[WiFi] Connected, IP: " + WiFi.localIP().toString());
+    
+    // I2C en Sensor initialisatie
+    Wire.begin(SDA_PIN,SCL_PIN);
+    Wire.setClock(400000);
 
-  Wire.begin(SDA_PIN,SCL_PIN);
-  Wire.setClock(400000);
+    ens.begin(); ens.setOperatingMode(SFE_ENS160_STANDARD);
+    aht.begin();
+    scd4x.begin(Wire,SCD41_ADDR); 
+    scd4x.stopPeriodicMeasurement(); delay(500); scd4x.startPeriodicMeasurement();
 
-  ens.begin(); ens.setOperatingMode(SFE_ENS160_STANDARD);
-  aht.begin();
-  scd4x.begin(Wire,SCD41_ADDR);
-  scd4x.stopPeriodicMeasurement(); delay(500); scd4x.startPeriodicMeasurement();
-
-  server.on("/", handleRoot);
-  server.on("/data.json", handleJson);
-  server.begin();
-  Serial.println("[Web] Server started");
-
-  mqtt.setServer(mqtt_server,mqtt_port);
-  reconnectMQTT();
+    // Webserver
+    server.on("/", handleRoot);
+    server.on("/data.json", handleJson);
+    server.begin();
+    Serial.println("[Web] Server started");
 }
 
 // -------- Loop --------
 void loop(){
-  if(!mqtt.connected()) reconnectMQTT();
-  mqtt.loop();
-
-  // SCD41
-  bool ready=false;
-  if(scd4x.getDataReadyStatus(ready)==0 && ready){
-    uint16_t co2; float t,rh;
-    if(scd4x.readMeasurement(co2,t,rh)==0 && co2!=0){
-      co2_ppm=co2; tC_scd=t; rh_scd=rh;
+    
+    // Sensor metingen
+    bool ready=false;
+    if(scd4x.getDataReadyStatus(ready)==0 && ready){
+        uint16_t co2; float t,rh;
+        if(scd4x.readMeasurement(co2,t,rh)==0 && co2!=0){
+            co2_ppm=co2; tC_scd=t; rh_scd=rh;
+        }
     }
-  }
 
-  // AHT21
-  sensors_event_t hum,temp;
-  if(aht.getEvent(&hum,&temp)){
-    tC_aht=temp.temperature; rh_aht=hum.relative_humidity;
-  }
+    sensors_event_t hum,temp;
+    if(aht.getEvent(&hum,&temp)){ tC_aht=temp.temperature; rh_aht=hum.relative_humidity; }
 
-  // ENS160
-  if(ens.checkDataStatus()){
-    tvoc_ppb=ens.getTVOC(); eco2_ppm=ens.getECO2(); aqi=ens.getAQI();
-  }
+    if(ens.checkDataStatus()){ tvoc_ppb=ens.getTVOC(); eco2_ppm=ens.getECO2(); aqi=ens.getAQI(); }
 
-  static uint32_t lastMQTT=0;
-  if(millis()-lastMQTT>5000){
-    lastMQTT=millis();
-    StaticJsonDocument<256> doc;
-    doc["co2"] = co2_ppm;
-    if(!isnan(tC_scd)) doc["t_scd"] = tC_scd;
-    if(!isnan(rh_scd)) doc["rh_scd"] = rh_scd;
-    doc["t_aht"] = tC_aht;
-    doc["rh_aht"] = rh_aht;
-    doc["tvoc"] = tvoc_ppb;
-    doc["eco2"] = eco2_ppm;
-    doc["aqi"] = aqi;
-    char buffer[256]; size_t n = serializeJson(doc, buffer);
-    mqtt.publish(mqtt_topic,(const uint8_t*)buffer,n,true);
-  }
+    static uint32_t lastREST=0; 
+    uint32_t now = millis();
 
-  server.handleClient();
+    // Verstuur ALLE sensoren via REST elke 5 seconden
+    if(now - lastREST > 5000){ 
+        lastREST = now;
+        if (WiFi.status() == WL_CONNECTED) {
+            sendAllSensorData(); 
+            sendAQIText();      // AQI tekst
+            sendVentHint();     // Ventilatiehint
+        } else {
+            Serial.println("[REST] WiFi lost. Trying to reconnect...");
+            WiFi.begin(ssid, password);
+        }
+    }
+
+    server.handleClient();
 }
