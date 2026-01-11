@@ -1,0 +1,8 @@
+# secrets
+secrets.h
+
+# Arduino build files
+*.bin
+*.elf
+*.hex
+*.ino.*
