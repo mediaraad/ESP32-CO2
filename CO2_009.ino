@@ -103,6 +103,7 @@ void sendToHASensorState(float value, const char* entity_suffix, const char* uni
     device["manufacturer"] = "DroneBot Workshop";
     
     String payload;
+    
     serializeJson(doc, payload);
 
     int httpResponseCode = http.POST(payload);
