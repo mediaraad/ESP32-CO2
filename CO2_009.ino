@@ -104,6 +104,7 @@ void sendToHASensorState(float value, const char* entity_suffix, const char* uni
     
     String payload;
     
+    
     serializeJson(doc, payload);
 
     int httpResponseCode = http.POST(payload);
